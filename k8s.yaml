@@ -1,0 +1,38 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resolver-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: resolver-test
+  template:
+    metadata:
+      labels:
+        name: resolver-test
+    spec:
+      containers:
+        - name: resolver
+          image: "ko://github.com/piyush-garg/resolver-test"
+          ports:
+            - name: resolver
+              containerPort: 8000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resolver-test
+spec:
+  ports:
+    - name: resolver
+      port: 8000
+      targetPort: 8000
+  selector:
+    name: resolver-test
