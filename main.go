@@ -1,15 +1,23 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"sigs.k8s.io/yaml"
+	"os"
+	"strings"
 
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/piyush-garg/resolver-test/structs"
 	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	git "gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	"gopkg.in/src-d/go-git.v4/storage/memory"
+	"sigs.k8s.io/yaml"
 )
 
 func main() {
@@ -41,7 +49,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		handleError(&w, 500, "Internal Server Error", "Error unmarhsalling JSON", err)
 		return
 	}
-	fmt.Println("yooooooooooooooooo")
 
 	handleSuccess(&w, request)
 }
@@ -50,9 +57,18 @@ func handleSuccess(w *http.ResponseWriter, request structs.ResolverRequest) {
 	writer := *w
 	response := structs.ResolverResponse{}
 
-	response.Payload = request.Payload
-	pipelinerun := getPR()
-	response.PipelineRuns = []*v1.PipelineRun{&pipelinerun}
+	payloadData := structs.Data{}
+	if err := decodeFromBase64(&payloadData, request.Data); err != nil {
+		handleError(w, http.StatusInternalServerError, "Internal Server Error", "Error decoding data string", err)
+		return
+	}
+
+	pipelinerun, err := clone(payloadData, request.Token)
+	if err != nil {
+		handleError(w, http.StatusInternalServerError, "Internal Server Error", "Error cloning", err)
+		return
+	}
+	response.PipelineRuns = pipelinerun
 	responseMarshalled, err := json.Marshal(response)
 	if err != nil {
 		handleError(w, http.StatusInternalServerError, "Internal Server Error", "Error marshalling response JSON", err)
@@ -138,3 +154,64 @@ spec:
                 # sleep 30
                 exit 0
 `
+
+func decodeFromBase64(v interface{}, enc string) error {
+	return json.NewDecoder(base64.NewDecoder(base64.StdEncoding, strings.NewReader(enc))).Decode(v)
+}
+
+func clone(payloadData structs.Data, token string) ([]*v1.PipelineRun, error) {
+	repo, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
+		URL: fmt.Sprintf("https://github.com/%s/%s", payloadData.GithubOrganization, payloadData.GithubRepository),
+		Auth: &githttp.BasicAuth{
+			Username: "abc123", // yes, this can be anything except an empty string
+			Password: token,
+		},
+		ReferenceName: plumbing.NewBranchReferenceName(payloadData.HeadBranch),
+		Progress:      os.Stdout,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ref, err := repo.Head()
+	if err != nil {
+		return nil, err
+	}
+
+	// ... retrieving the commit object
+	commit, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	tektontree, err := tree.Tree(".tekton")
+	if err != nil {
+		return nil, err
+	}
+
+	var prs []*v1.PipelineRun
+	tektontree.Files().ForEach(func(f *object.File) error {
+		if strings.HasSuffix(f.Name, "yaml") {
+			filecontent, err := f.Contents()
+			if err != nil {
+				return err
+			}
+			var p v1.PipelineRun
+			err = yaml.Unmarshal([]byte(filecontent), &p)
+			if err != nil {
+				return err
+			}
+			prs = append(prs, &p)
+		}
+		return nil
+	})
+	for _, pr := range prs {
+		pr.Name = "test-resolver" + pr.Name
+	}
+	return prs, nil
+}
